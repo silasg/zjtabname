@@ -1,0 +1,12 @@
+[package]
+name = "zjtabname"
+version = "0.1.0"
+edition = "2021"
+description = "Zellij plugin that automatically sets tab titles to the focused pane's title"
+
+[dependencies]
+zellij-tile = "0.43.1"
+
+[profile.release]
+opt-level = "s"
+lto = true

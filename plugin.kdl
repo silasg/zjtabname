@@ -1,0 +1,12 @@
+// Example: load zjtabname as a background plugin in a Zellij layout.
+//
+// Add this pane block inside a layout's `tab` section.
+// The plugin runs headlessly — it subscribes to events and renames tabs
+// to match the focused pane's title.
+
+pane {
+    plugin location="file:target/wasm32-wasip1/release/zjtabname.wasm"
+}
+
+// Or load at runtime:
+//   zellij action start-or-reload-plugin file:target/wasm32-wasip1/release/zjtabname.wasm
