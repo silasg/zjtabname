@@ -103,15 +103,15 @@ impl State {
     /// Apply computed renames via host API and update the cache.
     fn rename_tabs(&mut self) {
         let renames = self.compute_renames();
-        for (tab_position, name) in renames {
-            rename_tab(tab_position, &name);
+        for (pos_1_indexed, name) in renames {
+            rename_tab(pos_1_indexed, &name);
             self.last_set_names
-                .insert(tab_position as usize, name);
+                .insert((pos_1_indexed - 1) as usize, name);
         }
     }
 
     /// Compute which tabs need renaming.
-    /// Returns a vec of (0-indexed tab position, desired name).
+    /// Returns a vec of (1-indexed tab position, desired name).
     fn compute_renames(&self) -> Vec<(u32, String)> {
         if !self.permissions_granted {
             return vec![];
@@ -131,8 +131,8 @@ impl State {
                     .unwrap_or(false);
 
                 if !already_set && tab.name != desired_name {
-                    // rename_tab() takes a 0-indexed position, same as TabInfo.position.
-                    renames.push((tab.position as u32, desired_name));
+                    // rename_tab() takes a 1-indexed position; TabInfo.position is 0-indexed.
+                    renames.push(((tab.position + 1) as u32, desired_name));
                 }
             }
         }
@@ -369,11 +369,11 @@ mod tests {
         let renames = state.compute_renames();
 
         // Assert
-        assert_eq!(renames, vec![(0, "my-project".to_string())]);
+        assert_eq!(renames, vec![(1, "my-project".to_string())]);
     }
 
     #[test]
-    fn compute_renames_uses_0_indexed_tab_position() {
+    fn compute_renames_uses_1_indexed_tab_position() {
         // Arrange
         let state = State {
             permissions_granted: true,
@@ -386,7 +386,7 @@ mod tests {
         let renames = state.compute_renames();
 
         // Assert
-        assert_eq!(renames, vec![(2, "nvim".to_string())]);
+        assert_eq!(renames, vec![(3, "nvim".to_string())]);
     }
 
     #[test]
@@ -456,7 +456,7 @@ mod tests {
         let renames = state.compute_renames();
 
         // Assert
-        assert_eq!(renames, vec![(0, "new-title".to_string())]);
+        assert_eq!(renames, vec![(1, "new-title".to_string())]);
     }
 
     #[test]
@@ -484,8 +484,8 @@ mod tests {
         assert_eq!(
             renames,
             vec![
-                (0, "vim".to_string()),
-                (2, "htop".to_string()),
+                (1, "vim".to_string()),
+                (3, "htop".to_string()),
             ]
         );
     }
@@ -507,7 +507,7 @@ mod tests {
         let renames = state.compute_renames();
 
         // Assert
-        assert_eq!(renames, vec![(0, "shell".to_string())]);
+        assert_eq!(renames, vec![(1, "shell".to_string())]);
     }
 
     // ── prune_stale_cache_entries ────────────────────────────────────────
@@ -734,5 +734,4 @@ mod tests {
         // Assert
         assert_eq!(result, Some(20));
     }
-
 }
