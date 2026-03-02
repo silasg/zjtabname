@@ -117,6 +117,22 @@ impl State {
             return vec![];
         }
 
+        // Debug: dump PaneManifest keys vs TabInfo positions
+        let mut manifest_keys: Vec<usize> = self.pane_manifest.panes.keys().copied().collect();
+        manifest_keys.sort();
+        let tab_positions: Vec<usize> = self.tabs.iter().map(|t| t.position).collect();
+        eprintln!(
+            "[zjtabname] manifest keys: {:?}, tab positions: {:?}",
+            manifest_keys, tab_positions
+        );
+        for tab in &self.tabs {
+            let pane_title = self.find_focused_pane_title(tab.position);
+            eprintln!(
+                "[zjtabname] tab pos={} name={:?} -> manifest lookup({}) = {:?}",
+                tab.position, tab.name, tab.position, pane_title
+            );
+        }
+
         let mut renames = Vec::new();
         for tab in &self.tabs {
             if let Some(desired_name) = self.find_focused_pane_title(tab.position) {
@@ -136,6 +152,11 @@ impl State {
                 }
             }
         }
+
+        if !renames.is_empty() {
+            eprintln!("[zjtabname] renames: {:?}", renames);
+        }
+
         renames
     }
 
