@@ -70,6 +70,7 @@ Configuration is passed via the plugin block in KDL. Currently supported options
 | Option | Default | Description |
 |--------|---------|-------------|
 | `poll_interval_secs` | `2.0` | How often (in seconds) to poll for pane title changes. Zellij doesn't fire events when only a pane's terminal title changes, so the plugin periodically refocuses the active pane to detect updates. |
+| `rename_active_tab_only` | `false` | Only rename the currently active tab. See [Known Issues](#known-issues) for why you might want this. |
 
 Example:
 
@@ -77,6 +78,7 @@ Example:
 pane {
     plugin location="file:~/.config/zellij/plugins/zjtabname.wasm" {
         poll_interval_secs "5.0"
+        rename_active_tab_only "true"
     }
 }
 ```
@@ -86,6 +88,16 @@ pane {
 The plugin runs as a headless background pane (`set_selectable(false)`) and listens for `TabUpdate` and `PaneUpdate` events. On each event, it iterates all tabs, finds the focused non-plugin, non-suppressed pane in each tab, and renames the tab to that pane's title via `rename_tab()`.
 
 Because Zellij doesn't fire `PaneUpdate` when only a pane's terminal title changes (e.g., via OSC escape sequences), the plugin also uses a timer to periodically refocus the active pane, which triggers a fresh `PaneUpdate` with the latest title.
+
+## Known Issues
+
+### Tab renames target wrong tabs after closing a tab
+
+Zellij has an upstream bug ([#3535](https://github.com/zellij-org/zellij/issues/3535)) where `rename_tab()` misidentifies tabs after a tab has been closed. The plugin API parameter is documented as a tab *position* (visual order, renumbered after close), but Zellij's server internally treats it as a tab *index* (a stable internal ID that keeps gaps when tabs are closed). After closing a tab, positions and indices diverge, causing renames to hit the wrong tab.
+
+All known Zellij tab-renaming plugins ([zellij-attention](https://github.com/KiryuuLight/zellij-attention), [zellij-tabula](https://github.com/bezbac/zellij-tabula), [zellij-tab-name](https://github.com/Cynary/zellij-tab-name)) are affected by this same issue. A fix ([PR #4179](https://github.com/zellij-org/zellij/pull/4179)) exists upstream but is not yet merged.
+
+**Workaround:** Enable `rename_active_tab_only "true"` in the plugin configuration. This restricts renaming to the currently focused tab, whose position is always unambiguous. The trade-off is that background tabs keep whatever name they had when you last focused them, rather than updating live.
 
 ## Permissions
 

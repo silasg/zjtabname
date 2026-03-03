@@ -17,6 +17,14 @@ struct State {
     focused_pane_ids: HashMap<usize, u32>,
     /// Configurable poll interval (seconds) for timer-based refocus
     poll_interval_secs: f64,
+    /// When true, only rename the currently active tab. This works around
+    /// Zellij bug #3535 where `rename_tab()` misidentifies tabs after a tab
+    /// is closed, because the API parameter is treated as an internal tab
+    /// index (stable, with gaps) rather than the visual tab position.
+    /// When false, all tabs are renamed (works correctly as long as no tabs
+    /// have been closed during the session).
+    /// Override via plugin configuration: `rename_active_tab_only "true"`.
+    rename_active_tab_only: bool,
 }
 
 impl Default for State {
@@ -28,6 +36,7 @@ impl Default for State {
             last_set_names: HashMap::new(),
             focused_pane_ids: HashMap::new(),
             poll_interval_secs: DEFAULT_POLL_INTERVAL_SECS,
+            rename_active_tab_only: false,
         }
     }
 }
@@ -40,6 +49,11 @@ impl ZellijPlugin for State {
             .get("poll_interval_secs")
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_POLL_INTERVAL_SECS);
+
+        self.rename_active_tab_only = configuration
+            .get("rename_active_tab_only")
+            .map(|v| v == "true")
+            .unwrap_or(false);
 
         request_permission(&[
             PermissionType::ReadApplicationState,
@@ -117,24 +131,14 @@ impl State {
             return vec![];
         }
 
-        // Debug: dump PaneManifest keys vs TabInfo positions
-        let mut manifest_keys: Vec<usize> = self.pane_manifest.panes.keys().copied().collect();
-        manifest_keys.sort();
-        let tab_positions: Vec<usize> = self.tabs.iter().map(|t| t.position).collect();
-        eprintln!(
-            "[zjtabname] manifest keys: {:?}, tab positions: {:?}",
-            manifest_keys, tab_positions
-        );
-        for tab in &self.tabs {
-            let pane_title = self.find_focused_pane_title(tab.position);
-            eprintln!(
-                "[zjtabname] tab pos={} name={:?} -> manifest lookup({}) = {:?}",
-                tab.position, tab.name, tab.position, pane_title
-            );
-        }
+        let tabs_to_check: Vec<&TabInfo> = if self.rename_active_tab_only {
+            self.tabs.iter().filter(|t| t.active).collect()
+        } else {
+            self.tabs.iter().collect()
+        };
 
         let mut renames = Vec::new();
-        for tab in &self.tabs {
+        for tab in tabs_to_check {
             if let Some(desired_name) = self.find_focused_pane_title(tab.position) {
                 if desired_name.is_empty() {
                     continue;
@@ -152,11 +156,6 @@ impl State {
                 }
             }
         }
-
-        if !renames.is_empty() {
-            eprintln!("[zjtabname] renames: {:?}", renames);
-        }
-
         renames
     }
 
@@ -234,6 +233,13 @@ mod tests {
     fn make_manifest(entries: Vec<(usize, Vec<PaneInfo>)>) -> PaneManifest {
         PaneManifest {
             panes: entries.into_iter().collect(),
+        }
+    }
+
+    fn make_state_with_rename_active_only(rename_active_tab_only: bool) -> State {
+        State {
+            rename_active_tab_only,
+            ..Default::default()
         }
     }
 
@@ -529,6 +535,88 @@ mod tests {
 
         // Assert
         assert_eq!(renames, vec![(1, "shell".to_string())]);
+    }
+
+    // ── compute_renames with rename_active_tab_only ──────────────────────
+
+    #[test]
+    fn compute_renames_active_only_renames_only_active_tab() {
+        // Arrange
+        let state = State {
+            permissions_granted: true,
+            rename_active_tab_only: true,
+            tabs: vec![
+                make_tab(0, "Tab 1"),
+                make_active_tab(1, "Tab 2"),
+                make_tab(2, "Tab 3"),
+            ],
+            pane_manifest: make_manifest(vec![
+                (0, vec![make_pane(1, "vim", true)]),
+                (1, vec![make_pane(2, "htop", true)]),
+                (2, vec![make_pane(3, "cargo", true)]),
+            ]),
+            ..Default::default()
+        };
+
+        // Act
+        let renames = state.compute_renames();
+
+        // Assert — only the active tab (position 1) is renamed
+        assert_eq!(renames, vec![(2, "htop".to_string())]);
+    }
+
+    #[test]
+    fn compute_renames_active_only_returns_empty_when_active_tab_already_correct() {
+        // Arrange
+        let state = State {
+            permissions_granted: true,
+            rename_active_tab_only: true,
+            tabs: vec![
+                make_tab(0, "Tab 1"),
+                make_active_tab(1, "htop"),
+            ],
+            pane_manifest: make_manifest(vec![
+                (0, vec![make_pane(1, "vim", true)]),
+                (1, vec![make_pane(2, "htop", true)]),
+            ]),
+            ..Default::default()
+        };
+
+        // Act
+        let renames = state.compute_renames();
+
+        // Assert
+        assert!(renames.is_empty());
+    }
+
+    #[test]
+    fn compute_renames_all_tabs_when_flag_is_false() {
+        // Arrange
+        let state = State {
+            permissions_granted: true,
+            rename_active_tab_only: false,
+            tabs: vec![
+                make_tab(0, "Tab 1"),
+                make_active_tab(1, "Tab 2"),
+            ],
+            pane_manifest: make_manifest(vec![
+                (0, vec![make_pane(1, "vim", true)]),
+                (1, vec![make_pane(2, "htop", true)]),
+            ]),
+            ..Default::default()
+        };
+
+        // Act
+        let renames = state.compute_renames();
+
+        // Assert — both tabs renamed
+        assert_eq!(
+            renames,
+            vec![
+                (1, "vim".to_string()),
+                (2, "htop".to_string()),
+            ]
+        );
     }
 
     // ── prune_stale_cache_entries ────────────────────────────────────────
