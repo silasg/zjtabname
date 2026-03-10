@@ -17,14 +17,19 @@ struct State {
     focused_pane_ids: HashMap<usize, u32>,
     /// Configurable poll interval (seconds) for timer-based refocus
     poll_interval_secs: f64,
-    /// When true, only rename the currently active tab. This works around
-    /// Zellij bug #3535 where `rename_tab()` misidentifies tabs after a tab
-    /// is closed, because the API parameter is treated as an internal tab
-    /// index (stable, with gaps) rather than the visual tab position.
-    /// When false, all tabs are renamed (works correctly as long as no tabs
-    /// have been closed during the session).
-    /// Override via plugin configuration: `rename_active_tab_only "true"`.
-    rename_active_tab_only: bool,
+    /// When true (the default), only rename the currently active tab by
+    /// shelling out to `zellij action rename-tab` via `run_command()`.
+    /// This works around Zellij bug #3535 where the plugin API's
+    /// `rename_tab()` misidentifies tabs after a tab is closed, because
+    /// the position parameter is treated as an internal tab creation index
+    /// (stable, with gaps) rather than the visual tab position.
+    /// The CLI's `rename-tab` command operates on the current tab without
+    /// a position argument, completely sidestepping the bug.
+    /// When false, all tabs are renamed via the plugin API `rename_tab()`
+    /// (works correctly as long as no tabs have been closed during the
+    /// session).
+    /// Override via plugin configuration: `rename_via_cli_workaround "false"`.
+    rename_via_cli_workaround: bool,
 }
 
 impl Default for State {
@@ -36,7 +41,7 @@ impl Default for State {
             last_set_names: HashMap::new(),
             focused_pane_ids: HashMap::new(),
             poll_interval_secs: DEFAULT_POLL_INTERVAL_SECS,
-            rename_active_tab_only: false,
+            rename_via_cli_workaround: true,
         }
     }
 }
@@ -50,15 +55,19 @@ impl ZellijPlugin for State {
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_POLL_INTERVAL_SECS);
 
-        self.rename_active_tab_only = configuration
-            .get("rename_active_tab_only")
+        self.rename_via_cli_workaround = configuration
+            .get("rename_via_cli_workaround")
             .map(|v| v == "true")
-            .unwrap_or(false);
+            .unwrap_or(true);
 
-        request_permission(&[
+        let mut permissions = vec![
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
-        ]);
+        ];
+        if self.rename_via_cli_workaround {
+            permissions.push(PermissionType::RunCommands);
+        }
+        request_permission(&permissions);
         subscribe(&[
             EventType::TabUpdate,
             EventType::PaneUpdate,
@@ -114,11 +123,21 @@ impl State {
             .retain(|pos, _| active_positions.contains(pos));
     }
 
-    /// Apply computed renames via host API and update the cache.
+    /// Apply computed renames and update the cache.
+    /// When `rename_via_cli_workaround` is enabled, uses `zellij action rename-tab`
+    /// (which renames the current tab without a position argument) to sidestep
+    /// Zellij bug #3535. Otherwise, uses the plugin API `rename_tab()`.
     fn rename_tabs(&mut self) {
         let renames = self.compute_renames();
         for (pos_1_indexed, name) in renames {
-            rename_tab(pos_1_indexed, &name);
+            if self.rename_via_cli_workaround {
+                run_command(
+                    &["zellij", "action", "rename-tab", &name],
+                    BTreeMap::new(),
+                );
+            } else {
+                rename_tab(pos_1_indexed, &name);
+            }
             self.last_set_names
                 .insert((pos_1_indexed - 1) as usize, name);
         }
@@ -131,7 +150,7 @@ impl State {
             return vec![];
         }
 
-        let tabs_to_check: Vec<&TabInfo> = if self.rename_active_tab_only {
+        let tabs_to_check: Vec<&TabInfo> = if self.rename_via_cli_workaround {
             self.tabs.iter().filter(|t| t.active).collect()
         } else {
             self.tabs.iter().collect()
@@ -236,9 +255,9 @@ mod tests {
         }
     }
 
-    fn make_state_with_rename_active_only(rename_active_tab_only: bool) -> State {
+    fn make_state_with_cli_workaround(rename_via_cli_workaround: bool) -> State {
         State {
-            rename_active_tab_only,
+            rename_via_cli_workaround,
             ..Default::default()
         }
     }
@@ -387,6 +406,7 @@ mod tests {
         // Arrange
         let state = State {
             permissions_granted: true,
+            rename_via_cli_workaround: false,
             tabs: vec![make_tab(0, "Tab 1")],
             pane_manifest: make_manifest(vec![(0, vec![make_pane(1, "my-project", true)])]),
             ..Default::default()
@@ -404,6 +424,7 @@ mod tests {
         // Arrange
         let state = State {
             permissions_granted: true,
+            rename_via_cli_workaround: false,
             tabs: vec![make_tab(2, "Tab 3")],
             pane_manifest: make_manifest(vec![(2, vec![make_pane(5, "nvim", true)])]),
             ..Default::default()
@@ -473,6 +494,7 @@ mod tests {
         // Arrange
         let state = State {
             permissions_granted: true,
+            rename_via_cli_workaround: false,
             tabs: vec![make_tab(0, "old-title")],
             pane_manifest: make_manifest(vec![(0, vec![make_pane(1, "new-title", true)])]),
             last_set_names: HashMap::from([(0, "old-title".to_string())]),
@@ -491,6 +513,7 @@ mod tests {
         // Arrange
         let state = State {
             permissions_granted: true,
+            rename_via_cli_workaround: false,
             tabs: vec![
                 make_tab(0, "Tab 1"),
                 make_tab(1, "already-correct"),
@@ -522,6 +545,7 @@ mod tests {
         // Arrange
         let state = State {
             permissions_granted: true,
+            rename_via_cli_workaround: false,
             tabs: vec![make_tab(0, "Tab 1"), make_tab(1, "Tab 2")],
             pane_manifest: make_manifest(vec![
                 (0, vec![make_pane(1, "shell", true)]),
@@ -537,14 +561,14 @@ mod tests {
         assert_eq!(renames, vec![(1, "shell".to_string())]);
     }
 
-    // ── compute_renames with rename_active_tab_only ──────────────────────
+    // ── compute_renames with rename_via_cli_workaround ─────────────────
 
     #[test]
-    fn compute_renames_active_only_renames_only_active_tab() {
+    fn compute_renames_cli_workaround_renames_only_active_tab() {
         // Arrange
         let state = State {
             permissions_granted: true,
-            rename_active_tab_only: true,
+            rename_via_cli_workaround: true,
             tabs: vec![
                 make_tab(0, "Tab 1"),
                 make_active_tab(1, "Tab 2"),
@@ -566,11 +590,11 @@ mod tests {
     }
 
     #[test]
-    fn compute_renames_active_only_returns_empty_when_active_tab_already_correct() {
+    fn compute_renames_cli_workaround_returns_empty_when_active_tab_already_correct() {
         // Arrange
         let state = State {
             permissions_granted: true,
-            rename_active_tab_only: true,
+            rename_via_cli_workaround: true,
             tabs: vec![
                 make_tab(0, "Tab 1"),
                 make_active_tab(1, "htop"),
@@ -590,11 +614,11 @@ mod tests {
     }
 
     #[test]
-    fn compute_renames_all_tabs_when_flag_is_false() {
+    fn compute_renames_all_tabs_when_cli_workaround_disabled() {
         // Arrange
         let state = State {
             permissions_granted: true,
-            rename_active_tab_only: false,
+            rename_via_cli_workaround: false,
             tabs: vec![
                 make_tab(0, "Tab 1"),
                 make_active_tab(1, "Tab 2"),
@@ -616,6 +640,129 @@ mod tests {
                 (1, "vim".to_string()),
                 (2, "htop".to_string()),
             ]
+        );
+    }
+
+    // ── Zellij bug #3535: rename_tab position vs internal index ─────────
+    //
+    // These tests document the upstream bug where rename_tab(n) is treated
+    // as an internal tab index (creation ID) rather than a visual position.
+    // Our plugin computes the correct 1-indexed position, but Zellij's
+    // server does `screen.tabs.get_mut(&(n - 1))` where the map key is
+    // the creation index (stable, with gaps after tab closures).
+    //
+    // Scenario reproduced live:
+    //   1. Create 4 tabs: keys {0,1,2,3}, positions [0,1,2,3]
+    //   2. Close tab at position 1 (key 1)
+    //   3. Remaining: keys {0,2,3}, positions [0,1,2]
+    //   4. Active tab at position 2 (key 3), plugin calls rename_tab(3)
+    //   5. Server looks up tabs[3-1] = tabs[2] → the tab at position 1!
+    //   6. Result: the tab BEFORE the active one gets renamed.
+
+    /// Simulates the Zellij server's buggy rename_tab behavior.
+    /// Takes the 1-indexed position the plugin passes and the tab map
+    /// (creation_index -> tab_name), returns which tab name gets renamed.
+    fn zellij_server_rename_tab_buggy<'a>(
+        tab_map: &'a std::collections::BTreeMap<usize, &'a str>,
+        plugin_arg: u32,
+    ) -> Option<&'a str> {
+        // This is what Zellij's screen.rs does:
+        //   screen.tabs.get_mut(&tab_index.saturating_sub(1))
+        let key = (plugin_arg as usize).saturating_sub(1);
+        tab_map.get(&key).copied()
+    }
+
+    #[test]
+    fn zellij_bug_3535_rename_hits_wrong_tab_after_close() {
+        // Arrange: 4 tabs created, then tab at key 1 closed.
+        // Remaining internal map: {0: "TAB-1", 2: "TAB-3", 3: "TAB-4"}
+        // Visual positions after close: TAB-1=0, TAB-3=1, TAB-4=2
+        let tab_map: std::collections::BTreeMap<usize, &str> = [
+            (0, "TAB-1"),
+            (2, "TAB-3"),
+            (3, "TAB-4"),
+        ].into_iter().collect();
+
+        // Active tab is TAB-4 at visual position 2.
+        // Plugin correctly computes rename_tab(3) (position 2 + 1).
+        let state = State {
+            permissions_granted: true,
+            rename_via_cli_workaround: true,
+            tabs: vec![
+                make_tab(0, "TAB-1"),
+                make_tab(1, "TAB-3"),
+                make_active_tab(2, "TAB-4"),
+            ],
+            pane_manifest: make_manifest(vec![
+                (0, vec![make_pane(1, "pane-1", true)]),
+                (1, vec![make_pane(2, "pane-3", true)]),
+                (2, vec![make_pane(3, "new-title", true)]),
+            ]),
+            ..Default::default()
+        };
+
+        // Act: plugin computes the rename
+        let renames = state.compute_renames();
+        assert_eq!(renames.len(), 1);
+        let (plugin_position_arg, desired_name) = &renames[0];
+
+        // The plugin correctly targets position 3 (1-indexed) for TAB-4
+        assert_eq!(*plugin_position_arg, 3);
+        assert_eq!(desired_name, "new-title");
+
+        // But Zellij's server interprets this as internal key 2, which is TAB-3!
+        let actually_renamed = zellij_server_rename_tab_buggy(&tab_map, *plugin_position_arg);
+        assert_eq!(
+            actually_renamed,
+            Some("TAB-3"),
+            "BUG: Zellij renames TAB-3 instead of TAB-4 (see issue #3535)"
+        );
+        // This SHOULD be TAB-4, but the bug causes TAB-3 to be renamed instead.
+        assert_ne!(
+            actually_renamed,
+            Some("TAB-4"),
+            "If this fails, the Zellij bug has been fixed upstream!"
+        );
+    }
+
+    #[test]
+    fn zellij_bug_3535_rename_hits_deleted_key_becomes_noop() {
+        // Arrange: 3 tabs created, then tab at key 1 closed.
+        // Remaining internal map: {0: "TAB-1", 2: "TAB-3"}
+        // Visual positions: TAB-1=0, TAB-3=1
+        let tab_map: std::collections::BTreeMap<usize, &str> = [
+            (0, "TAB-1"),
+            (2, "TAB-3"),
+        ].into_iter().collect();
+
+        // Active tab is TAB-3 at visual position 1.
+        // Plugin computes rename_tab(2) (position 1 + 1).
+        let state = State {
+            permissions_granted: true,
+            rename_via_cli_workaround: true,
+            tabs: vec![
+                make_tab(0, "TAB-1"),
+                make_active_tab(1, "TAB-3"),
+            ],
+            pane_manifest: make_manifest(vec![
+                (0, vec![make_pane(1, "pane-1", true)]),
+                (1, vec![make_pane(2, "new-title", true)]),
+            ]),
+            ..Default::default()
+        };
+
+        // Act
+        let renames = state.compute_renames();
+        assert_eq!(renames.len(), 1);
+        let (plugin_position_arg, _) = &renames[0];
+        assert_eq!(*plugin_position_arg, 2);
+
+        // Zellij looks up tabs[2-1] = tabs[1], which was deleted → silent no-op
+        let actually_renamed = zellij_server_rename_tab_buggy(&tab_map, *plugin_position_arg);
+        assert_eq!(
+            actually_renamed,
+            None,
+            "BUG: rename_tab(2) hits deleted key 1, rename silently fails (see issue #3535)"
         );
     }
 

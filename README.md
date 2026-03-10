@@ -70,18 +70,20 @@ Configuration is passed via the plugin block in KDL. Currently supported options
 | Option | Default | Description |
 |--------|---------|-------------|
 | `poll_interval_secs` | `2.0` | How often (in seconds) to poll for pane title changes. Zellij doesn't fire events when only a pane's terminal title changes, so the plugin periodically refocuses the active pane to detect updates. |
-| `rename_active_tab_only` | `false` | Only rename the currently active tab. See [Known Issues](#known-issues) for why you might want this. |
+| `rename_via_cli_workaround` | `true` | Use `zellij action rename-tab` (via CLI) to rename only the active tab, sidestepping [Zellij bug #3535](#tab-renames-target-wrong-tabs-after-closing-a-tab). When `"false"`, all tabs are renamed via the plugin API's `rename_tab()` (works correctly as long as no tabs have been closed during the session). |
 
-Example:
+Example (in a layout pane):
 
 ```kdl
 pane {
     plugin location="file:~/.config/zellij/plugins/zjtabname.wasm" {
         poll_interval_secs "5.0"
-        rename_active_tab_only "true"
+        rename_via_cli_workaround "false"
     }
 }
 ```
+
+> **Note:** `load_plugins` in `config.kdl` does not support passing configuration parameters — only plain plugin URLs are accepted. To pass configuration, load the plugin via a layout pane block or the command line (`zellij action launch-or-focus-plugin --configuration "key=value"`).
 
 ## How it works
 
@@ -97,10 +99,11 @@ Zellij has an upstream bug ([#3535](https://github.com/zellij-org/zellij/issues/
 
 All known Zellij tab-renaming plugins ([zellij-attention](https://github.com/KiryuuLight/zellij-attention), [zellij-tabula](https://github.com/bezbac/zellij-tabula), [zellij-tab-name](https://github.com/Cynary/zellij-tab-name)) are affected by this same issue. A fix ([PR #4179](https://github.com/zellij-org/zellij/pull/4179)) exists upstream but is not yet merged.
 
-**Workaround:** Enable `rename_active_tab_only "true"` in the plugin configuration. This restricts renaming to the currently focused tab, whose position is always unambiguous. The trade-off is that background tabs keep whatever name they had when you last focused them, rather than updating live.
+**Workaround:** The plugin defaults to `rename_via_cli_workaround "true"`. Instead of using the buggy plugin API, it shells out to `zellij action rename-tab` which renames the current tab without a position argument, completely sidestepping the bug. The trade-off is that only the active tab is renamed — background tabs keep whatever name they had when you last focused them, rather than updating live.
 
 ## Permissions
 
-The plugin requests two permissions on first load:
+The plugin requests permissions on first load:
 - **ReadApplicationState** — to receive tab and pane update events
 - **ChangeApplicationState** — to rename tabs
+- **RunCommands** — to execute `zellij action rename-tab` (only when `rename_via_cli_workaround` is enabled, which is the default)
