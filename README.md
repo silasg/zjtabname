@@ -101,6 +101,10 @@ All known Zellij tab-renaming plugins ([zellij-attention](https://github.com/Kir
 
 **Workaround:** The plugin defaults to `rename_via_cli_workaround "true"`. Instead of using the buggy plugin API, it shells out to `zellij action rename-tab` which renames the current tab without a position argument, completely sidestepping the bug. The trade-off is that only the active tab is renamed — background tabs keep whatever name they had when you last focused them, rather than updating live.
 
+### Rare race condition with CLI rename workaround
+
+When `rename_via_cli_workaround` is enabled (the default), there is a small window between the plugin issuing `zellij action rename-tab` and Zellij processing it. If you switch tabs during that window, the rename may land on the newly active tab instead of the intended one. In practice this is very unlikely since the window is tiny, but it can result in a tab briefly showing another tab's name. Switching back and forth between tabs will correct it.
+
 ## Permissions
 
 The plugin requests permissions on first load:
