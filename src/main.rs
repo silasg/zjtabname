@@ -179,8 +179,14 @@ impl State {
     }
 
     /// Return the pane ID to refocus for title polling (only the active tab).
+    /// Returns `None` when floating panes are visible (e.g., the help window
+    /// opened via Ctrl+/) so that `focus_terminal_pane` doesn't steal focus
+    /// and close them.
     fn active_tab_pane_to_refocus(&self) -> Option<u32> {
         let active_tab = self.tabs.iter().find(|t| t.active)?;
+        if active_tab.are_floating_panes_visible {
+            return None;
+        }
         self.focused_pane_ids.get(&active_tab.position).copied()
     }
 
@@ -246,6 +252,13 @@ mod tests {
         TabInfo {
             active: true,
             ..make_tab(position, name)
+        }
+    }
+
+    fn make_active_tab_with_floating(position: usize, name: &str) -> TabInfo {
+        TabInfo {
+            are_floating_panes_visible: true,
+            ..make_active_tab(position, name)
         }
     }
 
@@ -989,5 +1002,37 @@ mod tests {
 
         // Assert
         assert_eq!(result, Some(20));
+    }
+
+    #[test]
+    fn active_tab_pane_to_refocus_returns_none_when_floating_panes_visible() {
+        // Arrange — e.g., the help window opened via Ctrl+/
+        let state = State {
+            tabs: vec![make_active_tab_with_floating(0, "Tab 1")],
+            focused_pane_ids: HashMap::from([(0, 10)]),
+            ..Default::default()
+        };
+
+        // Act
+        let result = state.active_tab_pane_to_refocus();
+
+        // Assert
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn active_tab_pane_to_refocus_resumes_after_floating_panes_closed() {
+        // Arrange — floating panes were visible but are now closed
+        let state = State {
+            tabs: vec![make_active_tab(0, "Tab 1")],
+            focused_pane_ids: HashMap::from([(0, 10)]),
+            ..Default::default()
+        };
+
+        // Act
+        let result = state.active_tab_pane_to_refocus();
+
+        // Assert
+        assert_eq!(result, Some(10));
     }
 }
