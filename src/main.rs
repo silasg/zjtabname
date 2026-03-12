@@ -17,18 +17,8 @@ struct State {
     focused_pane_ids: HashMap<usize, u32>,
     /// Configurable poll interval (seconds) for timer-based refocus
     poll_interval_secs: f64,
-    /// When true (the default), only rename the currently active tab by
-    /// shelling out to `zellij action rename-tab` via `run_command()`.
-    /// This works around Zellij bug #3535 where the plugin API's
-    /// `rename_tab()` misidentifies tabs after a tab is closed, because
-    /// the position parameter is treated as an internal tab creation index
-    /// (stable, with gaps) rather than the visual tab position.
-    /// The CLI's `rename-tab` command operates on the current tab without
-    /// a position argument, completely sidestepping the bug.
-    /// When false, all tabs are renamed via the plugin API `rename_tab()`
-    /// (works correctly as long as no tabs have been closed during the
-    /// session).
-    /// Override via plugin configuration: `rename_via_cli_workaround "false"`.
+    /// Work around Zellij bug #3535 by using `zellij action rename-tab`
+    /// (CLI) instead of the plugin API's `rename_tab()`. See README for details.
     rename_via_cli_workaround: bool,
 }
 
@@ -50,15 +40,7 @@ register_plugin!(State);
 
 impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
-        self.poll_interval_secs = configuration
-            .get("poll_interval_secs")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_POLL_INTERVAL_SECS);
-
-        self.rename_via_cli_workaround = configuration
-            .get("rename_via_cli_workaround")
-            .map(|v| v == "true")
-            .unwrap_or(true);
+        self.apply_configuration(&configuration);
 
         let mut permissions = vec![
             PermissionType::ReadApplicationState,
@@ -105,7 +87,7 @@ impl ZellijPlugin for State {
             }
             _ => {}
         }
-        false // no rendering needed
+        false
     }
 
     fn render(&mut self, _rows: usize, _cols: usize) {
@@ -113,7 +95,24 @@ impl ZellijPlugin for State {
     }
 }
 
+fn is_focused_terminal_pane(pane: &PaneInfo) -> bool {
+    pane.is_focused && !pane.is_plugin && !pane.is_suppressed
+}
+
 impl State {
+    /// Parse plugin configuration from the KDL config block.
+    fn apply_configuration(&mut self, configuration: &BTreeMap<String, String>) {
+        self.poll_interval_secs = configuration
+            .get("poll_interval_secs")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_POLL_INTERVAL_SECS);
+
+        self.rename_via_cli_workaround = configuration
+            .get("rename_via_cli_workaround")
+            .map(|v| v == "true")
+            .unwrap_or(true);
+    }
+
     /// Remove cache entries for tabs that no longer exist.
     fn prune_stale_cache_entries(&mut self) {
         let active_positions: HashSet<usize> = self.tabs.iter().map(|t| t.position).collect();
@@ -129,23 +128,22 @@ impl State {
     /// Zellij bug #3535. Otherwise, uses the plugin API `rename_tab()`.
     fn rename_tabs(&mut self) {
         let renames = self.compute_renames();
-        for (pos_1_indexed, name) in renames {
+        for (tab_position, name) in renames {
             if self.rename_via_cli_workaround {
                 run_command(
                     &["zellij", "action", "rename-tab", &name],
                     BTreeMap::new(),
                 );
             } else {
-                rename_tab(pos_1_indexed, &name);
+                rename_tab((tab_position + 1) as u32, &name);
             }
-            self.last_set_names
-                .insert((pos_1_indexed - 1) as usize, name);
+            self.last_set_names.insert(tab_position, name);
         }
     }
 
     /// Compute which tabs need renaming.
-    /// Returns a vec of (1-indexed tab position, desired name).
-    fn compute_renames(&self) -> Vec<(u32, String)> {
+    /// Returns a vec of (0-indexed tab position, desired name).
+    fn compute_renames(&self) -> Vec<(usize, String)> {
         if !self.permissions_granted {
             return vec![];
         }
@@ -166,12 +164,10 @@ impl State {
                 let already_set = self
                     .last_set_names
                     .get(&tab.position)
-                    .map(|n| n == &desired_name)
-                    .unwrap_or(false);
+                    .is_some_and(|n| n == &desired_name);
 
                 if !already_set && tab.name != desired_name {
-                    // rename_tab() takes a 1-indexed position; TabInfo.position is 0-indexed.
-                    renames.push(((tab.position + 1) as u32, desired_name));
+                    renames.push((tab.position, desired_name));
                 }
             }
         }
@@ -192,15 +188,16 @@ impl State {
 
     /// Extract focused terminal pane IDs from a pane manifest.
     fn extract_focused_pane_ids(manifest: &PaneManifest) -> HashMap<usize, u32> {
-        let mut focused = HashMap::new();
-        for (tab_pos, panes) in &manifest.panes {
-            for p in panes {
-                if p.is_focused && !p.is_plugin && !p.is_suppressed {
-                    focused.insert(*tab_pos, p.id);
-                }
-            }
-        }
-        focused
+        manifest
+            .panes
+            .iter()
+            .flat_map(|(tab_pos, panes)| {
+                panes
+                    .iter()
+                    .filter(|p| is_focused_terminal_pane(p))
+                    .map(move |p| (*tab_pos, p.id))
+            })
+            .collect()
     }
 
     /// Find the title of the focused non-plugin, non-suppressed pane in a given tab.
@@ -208,7 +205,7 @@ impl State {
         let panes = self.pane_manifest.panes.get(&tab_position)?;
         panes
             .iter()
-            .find(|p| p.is_focused && !p.is_plugin && !p.is_suppressed)
+            .find(|p| is_focused_terminal_pane(p))
             .map(|p| p.title.clone())
     }
 }
@@ -265,13 +262,6 @@ mod tests {
     fn make_manifest(entries: Vec<(usize, Vec<PaneInfo>)>) -> PaneManifest {
         PaneManifest {
             panes: entries.into_iter().collect(),
-        }
-    }
-
-    fn make_state_with_cli_workaround(rename_via_cli_workaround: bool) -> State {
-        State {
-            rename_via_cli_workaround,
-            ..Default::default()
         }
     }
 
@@ -429,11 +419,11 @@ mod tests {
         let renames = state.compute_renames();
 
         // Assert
-        assert_eq!(renames, vec![(1, "my-project".to_string())]);
+        assert_eq!(renames, vec![(0, "my-project".to_string())]);
     }
 
     #[test]
-    fn compute_renames_uses_1_indexed_tab_position() {
+    fn compute_renames_uses_tab_position_from_tab_info() {
         // Arrange
         let state = State {
             permissions_granted: true,
@@ -447,7 +437,7 @@ mod tests {
         let renames = state.compute_renames();
 
         // Assert
-        assert_eq!(renames, vec![(3, "nvim".to_string())]);
+        assert_eq!(renames, vec![(2, "nvim".to_string())]);
     }
 
     #[test]
@@ -518,7 +508,7 @@ mod tests {
         let renames = state.compute_renames();
 
         // Assert
-        assert_eq!(renames, vec![(1, "new-title".to_string())]);
+        assert_eq!(renames, vec![(0, "new-title".to_string())]);
     }
 
     #[test]
@@ -547,8 +537,8 @@ mod tests {
         assert_eq!(
             renames,
             vec![
-                (1, "vim".to_string()),
-                (3, "htop".to_string()),
+                (0, "vim".to_string()),
+                (2, "htop".to_string()),
             ]
         );
     }
@@ -571,7 +561,7 @@ mod tests {
         let renames = state.compute_renames();
 
         // Assert
-        assert_eq!(renames, vec![(1, "shell".to_string())]);
+        assert_eq!(renames, vec![(0, "shell".to_string())]);
     }
 
     // ── compute_renames with rename_via_cli_workaround ─────────────────
@@ -599,7 +589,7 @@ mod tests {
         let renames = state.compute_renames();
 
         // Assert — only the active tab (position 1) is renamed
-        assert_eq!(renames, vec![(2, "htop".to_string())]);
+        assert_eq!(renames, vec![(1, "htop".to_string())]);
     }
 
     #[test]
@@ -650,8 +640,8 @@ mod tests {
         assert_eq!(
             renames,
             vec![
-                (1, "vim".to_string()),
-                (2, "htop".to_string()),
+                (0, "vim".to_string()),
+                (1, "htop".to_string()),
             ]
         );
     }
@@ -714,17 +704,20 @@ mod tests {
             ..Default::default()
         };
 
-        // Act: plugin computes the rename
+        // Act: plugin computes the rename (0-indexed position)
         let renames = state.compute_renames();
         assert_eq!(renames.len(), 1);
-        let (plugin_position_arg, desired_name) = &renames[0];
+        let (tab_position, desired_name) = &renames[0];
 
-        // The plugin correctly targets position 3 (1-indexed) for TAB-4
-        assert_eq!(*plugin_position_arg, 3);
+        // The plugin correctly targets position 2 (0-indexed) for TAB-4
+        assert_eq!(*tab_position, 2);
         assert_eq!(desired_name, "new-title");
 
+        // rename_tabs() converts to 1-indexed for the plugin API: 2 + 1 = 3
+        let api_arg = (*tab_position as u32) + 1;
+
         // But Zellij's server interprets this as internal key 2, which is TAB-3!
-        let actually_renamed = zellij_server_rename_tab_buggy(&tab_map, *plugin_position_arg);
+        let actually_renamed = zellij_server_rename_tab_buggy(&tab_map, api_arg);
         assert_eq!(
             actually_renamed,
             Some("TAB-3"),
@@ -767,11 +760,14 @@ mod tests {
         // Act
         let renames = state.compute_renames();
         assert_eq!(renames.len(), 1);
-        let (plugin_position_arg, _) = &renames[0];
-        assert_eq!(*plugin_position_arg, 2);
+        let (tab_position, _) = &renames[0];
+        assert_eq!(*tab_position, 1);
+
+        // rename_tabs() converts to 1-indexed: 1 + 1 = 2
+        let api_arg = (*tab_position as u32) + 1;
 
         // Zellij looks up tabs[2-1] = tabs[1], which was deleted → silent no-op
-        let actually_renamed = zellij_server_rename_tab_buggy(&tab_map, *plugin_position_arg);
+        let actually_renamed = zellij_server_rename_tab_buggy(&tab_map, api_arg);
         assert_eq!(
             actually_renamed,
             None,
