@@ -5,8 +5,10 @@ edition = "2021"
 description = "Zellij plugin that automatically sets tab titles to the focused pane's title"
 
 [dependencies]
-zellij-tile = "0.43.1"
+zellij-tile = "0.44"
 
 [profile.release]
 opt-level = "s"
 lto = true
+strip = true
+codegen-units = 1

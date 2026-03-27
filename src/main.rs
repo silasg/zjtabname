@@ -4,22 +4,22 @@ use zellij_tile::prelude::*;
 /// Default poll interval (in seconds) for refocusing panes to pick up title
 /// changes. Zellij's PaneUpdate event doesn't fire on title-only changes,
 /// so we periodically refocus to trigger a fresh PaneUpdate.
+/// The CwdChanged event handles the most common case (shell directory changes),
+/// so this timer is primarily a fallback for programs that set their own title
+/// (e.g., vim, htop) without a CWD change.
 /// Override via plugin configuration: `poll_interval_secs "5.0"`.
-const DEFAULT_POLL_INTERVAL_SECS: f64 = 2.0;
+const DEFAULT_POLL_INTERVAL_SECS: f64 = 5.0;
 
 struct State {
     tabs: Vec<TabInfo>,
     pane_manifest: PaneManifest,
     permissions_granted: bool,
-    /// Cache: tab_position -> last_set_name (avoid redundant rename calls)
+    /// Cache: tab_id -> last_set_name (avoid redundant rename calls)
     last_set_names: HashMap<usize, String>,
-    /// Track focused terminal pane IDs per tab for timer-based refocus
+    /// Track focused terminal pane IDs per tab_id for timer-based refocus
     focused_pane_ids: HashMap<usize, u32>,
     /// Configurable poll interval (seconds) for timer-based refocus
     poll_interval_secs: f64,
-    /// Work around Zellij bug #3535 by using `zellij action rename-tab`
-    /// (CLI) instead of the plugin API's `rename_tab()`. See README for details.
-    rename_via_cli_workaround: bool,
 }
 
 impl Default for State {
@@ -31,7 +31,6 @@ impl Default for State {
             last_set_names: HashMap::new(),
             focused_pane_ids: HashMap::new(),
             poll_interval_secs: DEFAULT_POLL_INTERVAL_SECS,
-            rename_via_cli_workaround: true,
         }
     }
 }
@@ -42,19 +41,17 @@ impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
         self.apply_configuration(&configuration);
 
-        let mut permissions = vec![
+        request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
-        ];
-        if self.rename_via_cli_workaround {
-            permissions.push(PermissionType::RunCommands);
-        }
-        request_permission(&permissions);
+        ]);
         subscribe(&[
             EventType::TabUpdate,
             EventType::PaneUpdate,
             EventType::PermissionRequestResult,
             EventType::Timer,
+            EventType::CwdChanged,
+            EventType::PluginConfigurationChanged,
         ]);
         set_selectable(false);
         set_timeout(self.poll_interval_secs);
@@ -71,9 +68,20 @@ impl ZellijPlugin for State {
                 self.rename_tabs();
             }
             Event::PaneUpdate(manifest) => {
-                self.focused_pane_ids = Self::extract_focused_pane_ids(&manifest);
+                self.focused_pane_ids = Self::extract_focused_pane_ids(&manifest, &self.tabs);
                 self.pane_manifest = manifest;
                 self.rename_tabs();
+            }
+            Event::CwdChanged(_pane_id, _path, _client_ids) => {
+                // CWD changed, but the shell prompt hook hasn't updated the
+                // terminal title yet. Refocus the active pane to trigger a
+                // fresh PaneUpdate that will carry the new title.
+                if let Some(pane_id) = self.active_tab_pane_to_refocus() {
+                    focus_terminal_pane(pane_id, false, false);
+                }
+            }
+            Event::PluginConfigurationChanged(config) => {
+                self.apply_configuration(&config);
             }
             Event::Timer(_elapsed) => {
                 // Refocus the pane in the active tab to trigger a fresh PaneUpdate.
@@ -81,7 +89,7 @@ impl ZellijPlugin for State {
                 // a pane's terminal title changes (e.g., via OSC escape sequences).
                 // Only refocus the active tab to avoid switching tabs as a side effect.
                 if let Some(pane_id) = self.active_tab_pane_to_refocus() {
-                    focus_terminal_pane(pane_id, false);
+                    focus_terminal_pane(pane_id, false, false);
                 }
                 set_timeout(self.poll_interval_secs);
             }
@@ -107,55 +115,35 @@ impl State {
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_POLL_INTERVAL_SECS);
 
-        self.rename_via_cli_workaround = configuration
-            .get("rename_via_cli_workaround")
-            .map(|v| v == "true")
-            .unwrap_or(true);
     }
 
     /// Remove cache entries for tabs that no longer exist.
     fn prune_stale_cache_entries(&mut self) {
-        let active_positions: HashSet<usize> = self.tabs.iter().map(|t| t.position).collect();
+        let active_tab_ids: HashSet<usize> = self.tabs.iter().map(|t| t.tab_id).collect();
         self.last_set_names
-            .retain(|pos, _| active_positions.contains(pos));
+            .retain(|id, _| active_tab_ids.contains(id));
         self.focused_pane_ids
-            .retain(|pos, _| active_positions.contains(pos));
+            .retain(|id, _| active_tab_ids.contains(id));
     }
 
     /// Apply computed renames and update the cache.
-    /// When `rename_via_cli_workaround` is enabled, uses `zellij action rename-tab`
-    /// (which renames the current tab without a position argument) to sidestep
-    /// Zellij bug #3535. Otherwise, uses the plugin API `rename_tab()`.
     fn rename_tabs(&mut self) {
         let renames = self.compute_renames();
-        for (tab_position, name) in renames {
-            if self.rename_via_cli_workaround {
-                run_command(
-                    &["zellij", "action", "rename-tab", &name],
-                    BTreeMap::new(),
-                );
-            } else {
-                rename_tab((tab_position + 1) as u32, &name);
-            }
-            self.last_set_names.insert(tab_position, name);
+        for (tab_id, name) in renames {
+            rename_tab_with_id(tab_id as u64, &name);
+            self.last_set_names.insert(tab_id, name);
         }
     }
 
     /// Compute which tabs need renaming.
-    /// Returns a vec of (0-indexed tab position, desired name).
+    /// Returns a vec of (tab_id, desired name).
     fn compute_renames(&self) -> Vec<(usize, String)> {
         if !self.permissions_granted {
             return vec![];
         }
 
-        let tabs_to_check: Vec<&TabInfo> = if self.rename_via_cli_workaround {
-            self.tabs.iter().filter(|t| t.active).collect()
-        } else {
-            self.tabs.iter().collect()
-        };
-
         let mut renames = Vec::new();
-        for tab in tabs_to_check {
+        for tab in &self.tabs {
             if let Some(desired_name) = self.find_focused_pane_title(tab.position) {
                 if desired_name.is_empty() {
                     continue;
@@ -163,11 +151,11 @@ impl State {
 
                 let already_set = self
                     .last_set_names
-                    .get(&tab.position)
+                    .get(&tab.tab_id)
                     .is_some_and(|n| n == &desired_name);
 
                 if !already_set && tab.name != desired_name {
-                    renames.push((tab.position, desired_name));
+                    renames.push((tab.tab_id, desired_name));
                 }
             }
         }
@@ -183,19 +171,22 @@ impl State {
         if active_tab.are_floating_panes_visible {
             return None;
         }
-        self.focused_pane_ids.get(&active_tab.position).copied()
+        self.focused_pane_ids.get(&active_tab.tab_id).copied()
     }
 
-    /// Extract focused terminal pane IDs from a pane manifest.
-    fn extract_focused_pane_ids(manifest: &PaneManifest) -> HashMap<usize, u32> {
+    /// Extract focused terminal pane IDs from a pane manifest, keyed by tab_id.
+    fn extract_focused_pane_ids(manifest: &PaneManifest, tabs: &[TabInfo]) -> HashMap<usize, u32> {
+        let pos_to_id: HashMap<usize, usize> = tabs.iter().map(|t| (t.position, t.tab_id)).collect();
+
         manifest
             .panes
             .iter()
             .flat_map(|(tab_pos, panes)| {
+                let tab_id = pos_to_id.get(tab_pos).copied();
                 panes
                     .iter()
                     .filter(|p| is_focused_terminal_pane(p))
-                    .map(move |p| (*tab_pos, p.id))
+                    .filter_map(move |p| tab_id.map(|id| (id, p.id)))
             })
             .collect()
     }
@@ -237,25 +228,26 @@ mod tests {
         }
     }
 
-    fn make_tab(position: usize, name: &str) -> TabInfo {
+    fn make_tab(position: usize, name: &str, tab_id: usize) -> TabInfo {
         TabInfo {
             position,
             name: name.to_string(),
+            tab_id,
             ..Default::default()
         }
     }
 
-    fn make_active_tab(position: usize, name: &str) -> TabInfo {
+    fn make_active_tab(position: usize, name: &str, tab_id: usize) -> TabInfo {
         TabInfo {
             active: true,
-            ..make_tab(position, name)
+            ..make_tab(position, name, tab_id)
         }
     }
 
-    fn make_active_tab_with_floating(position: usize, name: &str) -> TabInfo {
+    fn make_active_tab_with_floating(position: usize, name: &str, tab_id: usize) -> TabInfo {
         TabInfo {
             are_floating_panes_visible: true,
-            ..make_active_tab(position, name)
+            ..make_active_tab(position, name, tab_id)
         }
     }
 
@@ -392,7 +384,7 @@ mod tests {
         // Arrange
         let state = State {
             permissions_granted: false,
-            tabs: vec![make_tab(0, "Tab 1")],
+            tabs: vec![make_tab(0, "Tab 1", 100)],
             pane_manifest: make_manifest(vec![(0, vec![make_pane(1, "shell", true)])]),
             ..Default::default()
         };
@@ -409,8 +401,7 @@ mod tests {
         // Arrange
         let state = State {
             permissions_granted: true,
-            rename_via_cli_workaround: false,
-            tabs: vec![make_tab(0, "Tab 1")],
+            tabs: vec![make_tab(0, "Tab 1", 100)],
             pane_manifest: make_manifest(vec![(0, vec![make_pane(1, "my-project", true)])]),
             ..Default::default()
         };
@@ -419,16 +410,15 @@ mod tests {
         let renames = state.compute_renames();
 
         // Assert
-        assert_eq!(renames, vec![(0, "my-project".to_string())]);
+        assert_eq!(renames, vec![(100, "my-project".to_string())]);
     }
 
     #[test]
-    fn compute_renames_uses_tab_position_from_tab_info() {
-        // Arrange
+    fn compute_renames_uses_tab_id_not_position() {
+        // Arrange — position=2 but tab_id=200, verify rename uses tab_id
         let state = State {
             permissions_granted: true,
-            rename_via_cli_workaround: false,
-            tabs: vec![make_tab(2, "Tab 3")],
+            tabs: vec![make_tab(2, "Tab 3", 200)],
             pane_manifest: make_manifest(vec![(2, vec![make_pane(5, "nvim", true)])]),
             ..Default::default()
         };
@@ -436,8 +426,8 @@ mod tests {
         // Act
         let renames = state.compute_renames();
 
-        // Assert
-        assert_eq!(renames, vec![(2, "nvim".to_string())]);
+        // Assert — key is tab_id (200), not position (2)
+        assert_eq!(renames, vec![(200, "nvim".to_string())]);
     }
 
     #[test]
@@ -445,7 +435,7 @@ mod tests {
         // Arrange
         let state = State {
             permissions_granted: true,
-            tabs: vec![make_tab(0, "Tab 1")],
+            tabs: vec![make_tab(0, "Tab 1", 100)],
             pane_manifest: make_manifest(vec![(0, vec![make_pane(1, "", true)])]),
             ..Default::default()
         };
@@ -459,12 +449,12 @@ mod tests {
 
     #[test]
     fn compute_renames_skips_when_already_cached() {
-        // Arrange
+        // Arrange — cache keyed by tab_id (100)
         let state = State {
             permissions_granted: true,
-            tabs: vec![make_tab(0, "old-name")],
+            tabs: vec![make_tab(0, "old-name", 100)],
             pane_manifest: make_manifest(vec![(0, vec![make_pane(1, "shell", true)])]),
-            last_set_names: HashMap::from([(0, "shell".to_string())]),
+            last_set_names: HashMap::from([(100, "shell".to_string())]),
             ..Default::default()
         };
 
@@ -480,7 +470,7 @@ mod tests {
         // Arrange
         let state = State {
             permissions_granted: true,
-            tabs: vec![make_tab(0, "shell")],
+            tabs: vec![make_tab(0, "shell", 100)],
             pane_manifest: make_manifest(vec![(0, vec![make_pane(1, "shell", true)])]),
             ..Default::default()
         };
@@ -494,13 +484,12 @@ mod tests {
 
     #[test]
     fn compute_renames_renames_when_cache_differs_from_desired() {
-        // Arrange
+        // Arrange — cache keyed by tab_id (100)
         let state = State {
             permissions_granted: true,
-            rename_via_cli_workaround: false,
-            tabs: vec![make_tab(0, "old-title")],
+            tabs: vec![make_tab(0, "old-title", 100)],
             pane_manifest: make_manifest(vec![(0, vec![make_pane(1, "new-title", true)])]),
-            last_set_names: HashMap::from([(0, "old-title".to_string())]),
+            last_set_names: HashMap::from([(100, "old-title".to_string())]),
             ..Default::default()
         };
 
@@ -508,7 +497,7 @@ mod tests {
         let renames = state.compute_renames();
 
         // Assert
-        assert_eq!(renames, vec![(0, "new-title".to_string())]);
+        assert_eq!(renames, vec![(100, "new-title".to_string())]);
     }
 
     #[test]
@@ -516,11 +505,10 @@ mod tests {
         // Arrange
         let state = State {
             permissions_granted: true,
-            rename_via_cli_workaround: false,
             tabs: vec![
-                make_tab(0, "Tab 1"),
-                make_tab(1, "already-correct"),
-                make_tab(2, "Tab 3"),
+                make_tab(0, "Tab 1", 100),
+                make_tab(1, "already-correct", 101),
+                make_tab(2, "Tab 3", 102),
             ],
             pane_manifest: make_manifest(vec![
                 (0, vec![make_pane(1, "vim", true)]),
@@ -537,8 +525,8 @@ mod tests {
         assert_eq!(
             renames,
             vec![
-                (0, "vim".to_string()),
-                (2, "htop".to_string()),
+                (100, "vim".to_string()),
+                (102, "htop".to_string()),
             ]
         );
     }
@@ -548,8 +536,7 @@ mod tests {
         // Arrange
         let state = State {
             permissions_granted: true,
-            rename_via_cli_workaround: false,
-            tabs: vec![make_tab(0, "Tab 1"), make_tab(1, "Tab 2")],
+            tabs: vec![make_tab(0, "Tab 1", 100), make_tab(1, "Tab 2", 101)],
             pane_manifest: make_manifest(vec![
                 (0, vec![make_pane(1, "shell", true)]),
                 (1, vec![make_pane(2, "unfocused", false)]),
@@ -561,21 +548,18 @@ mod tests {
         let renames = state.compute_renames();
 
         // Assert
-        assert_eq!(renames, vec![(0, "shell".to_string())]);
+        assert_eq!(renames, vec![(100, "shell".to_string())]);
     }
 
-    // ── compute_renames with rename_via_cli_workaround ─────────────────
-
     #[test]
-    fn compute_renames_cli_workaround_renames_only_active_tab() {
-        // Arrange
+    fn compute_renames_renames_all_tabs_not_just_active() {
+        // Arrange — both active and inactive tabs should be renamed
         let state = State {
             permissions_granted: true,
-            rename_via_cli_workaround: true,
             tabs: vec![
-                make_tab(0, "Tab 1"),
-                make_active_tab(1, "Tab 2"),
-                make_tab(2, "Tab 3"),
+                make_tab(0, "Tab 1", 100),
+                make_active_tab(1, "Tab 2", 101),
+                make_tab(2, "Tab 3", 102),
             ],
             pane_manifest: make_manifest(vec![
                 (0, vec![make_pane(1, "vim", true)]),
@@ -588,206 +572,60 @@ mod tests {
         // Act
         let renames = state.compute_renames();
 
-        // Assert — only the active tab (position 1) is renamed
-        assert_eq!(renames, vec![(1, "htop".to_string())]);
-    }
-
-    #[test]
-    fn compute_renames_cli_workaround_returns_empty_when_active_tab_already_correct() {
-        // Arrange
-        let state = State {
-            permissions_granted: true,
-            rename_via_cli_workaround: true,
-            tabs: vec![
-                make_tab(0, "Tab 1"),
-                make_active_tab(1, "htop"),
-            ],
-            pane_manifest: make_manifest(vec![
-                (0, vec![make_pane(1, "vim", true)]),
-                (1, vec![make_pane(2, "htop", true)]),
-            ]),
-            ..Default::default()
-        };
-
-        // Act
-        let renames = state.compute_renames();
-
-        // Assert
-        assert!(renames.is_empty());
-    }
-
-    #[test]
-    fn compute_renames_all_tabs_when_cli_workaround_disabled() {
-        // Arrange
-        let state = State {
-            permissions_granted: true,
-            rename_via_cli_workaround: false,
-            tabs: vec![
-                make_tab(0, "Tab 1"),
-                make_active_tab(1, "Tab 2"),
-            ],
-            pane_manifest: make_manifest(vec![
-                (0, vec![make_pane(1, "vim", true)]),
-                (1, vec![make_pane(2, "htop", true)]),
-            ]),
-            ..Default::default()
-        };
-
-        // Act
-        let renames = state.compute_renames();
-
-        // Assert — both tabs renamed
+        // Assert — all three tabs renamed, not just the active one
         assert_eq!(
             renames,
             vec![
-                (0, "vim".to_string()),
-                (1, "htop".to_string()),
+                (100, "vim".to_string()),
+                (101, "htop".to_string()),
+                (102, "cargo".to_string()),
             ]
         );
     }
 
-    // ── Zellij bug #3535: rename_tab position vs internal index ─────────
-    //
-    // These tests document the upstream bug where rename_tab(n) is treated
-    // as an internal tab index (creation ID) rather than a visual position.
-    // Our plugin computes the correct 1-indexed position, but Zellij's
-    // server does `screen.tabs.get_mut(&(n - 1))` where the map key is
-    // the creation index (stable, with gaps after tab closures).
-    //
-    // Scenario reproduced live:
-    //   1. Create 4 tabs: keys {0,1,2,3}, positions [0,1,2,3]
-    //   2. Close tab at position 1 (key 1)
-    //   3. Remaining: keys {0,2,3}, positions [0,1,2]
-    //   4. Active tab at position 2 (key 3), plugin calls rename_tab(3)
-    //   5. Server looks up tabs[3-1] = tabs[2] → the tab at position 1!
-    //   6. Result: the tab BEFORE the active one gets renamed.
-
-    /// Simulates the Zellij server's buggy rename_tab behavior.
-    /// Takes the 1-indexed position the plugin passes and the tab map
-    /// (creation_index -> tab_name), returns which tab name gets renamed.
-    fn zellij_server_rename_tab_buggy<'a>(
-        tab_map: &'a std::collections::BTreeMap<usize, &'a str>,
-        plugin_arg: u32,
-    ) -> Option<&'a str> {
-        // This is what Zellij's screen.rs does:
-        //   screen.tabs.get_mut(&tab_index.saturating_sub(1))
-        let key = (plugin_arg as usize).saturating_sub(1);
-        tab_map.get(&key).copied()
-    }
-
     #[test]
-    fn zellij_bug_3535_rename_hits_wrong_tab_after_close() {
-        // Arrange: 4 tabs created, then tab at key 1 closed.
-        // Remaining internal map: {0: "TAB-1", 2: "TAB-3", 3: "TAB-4"}
-        // Visual positions after close: TAB-1=0, TAB-3=1, TAB-4=2
-        let tab_map: std::collections::BTreeMap<usize, &str> = [
-            (0, "TAB-1"),
-            (2, "TAB-3"),
-            (3, "TAB-4"),
-        ].into_iter().collect();
-
-        // Active tab is TAB-4 at visual position 2.
-        // Plugin correctly computes rename_tab(3) (position 2 + 1).
+    fn compute_renames_survives_tab_close_with_stable_ids() {
+        // Arrange: 3 tabs created (tab_ids 100, 101, 102), tab 101 closed.
+        // Remaining: tab_id 100 at position 0, tab_id 102 at position 1.
+        // Cache has entry for closed tab_id 101 — should not interfere.
         let state = State {
             permissions_granted: true,
-            rename_via_cli_workaround: true,
             tabs: vec![
-                make_tab(0, "TAB-1"),
-                make_tab(1, "TAB-3"),
-                make_active_tab(2, "TAB-4"),
+                make_tab(0, "Tab 1", 100),
+                make_tab(1, "Tab 3", 102),
             ],
             pane_manifest: make_manifest(vec![
-                (0, vec![make_pane(1, "pane-1", true)]),
-                (1, vec![make_pane(2, "pane-3", true)]),
-                (2, vec![make_pane(3, "new-title", true)]),
+                (0, vec![make_pane(1, "shell", true)]),
+                (1, vec![make_pane(3, "vim", true)]),
             ]),
-            ..Default::default()
-        };
-
-        // Act: plugin computes the rename (0-indexed position)
-        let renames = state.compute_renames();
-        assert_eq!(renames.len(), 1);
-        let (tab_position, desired_name) = &renames[0];
-
-        // The plugin correctly targets position 2 (0-indexed) for TAB-4
-        assert_eq!(*tab_position, 2);
-        assert_eq!(desired_name, "new-title");
-
-        // rename_tabs() converts to 1-indexed for the plugin API: 2 + 1 = 3
-        let api_arg = (*tab_position as u32) + 1;
-
-        // But Zellij's server interprets this as internal key 2, which is TAB-3!
-        let actually_renamed = zellij_server_rename_tab_buggy(&tab_map, api_arg);
-        assert_eq!(
-            actually_renamed,
-            Some("TAB-3"),
-            "BUG: Zellij renames TAB-3 instead of TAB-4 (see issue #3535)"
-        );
-        // This SHOULD be TAB-4, but the bug causes TAB-3 to be renamed instead.
-        assert_ne!(
-            actually_renamed,
-            Some("TAB-4"),
-            "If this fails, the Zellij bug has been fixed upstream!"
-        );
-    }
-
-    #[test]
-    fn zellij_bug_3535_rename_hits_deleted_key_becomes_noop() {
-        // Arrange: 3 tabs created, then tab at key 1 closed.
-        // Remaining internal map: {0: "TAB-1", 2: "TAB-3"}
-        // Visual positions: TAB-1=0, TAB-3=1
-        let tab_map: std::collections::BTreeMap<usize, &str> = [
-            (0, "TAB-1"),
-            (2, "TAB-3"),
-        ].into_iter().collect();
-
-        // Active tab is TAB-3 at visual position 1.
-        // Plugin computes rename_tab(2) (position 1 + 1).
-        let state = State {
-            permissions_granted: true,
-            rename_via_cli_workaround: true,
-            tabs: vec![
-                make_tab(0, "TAB-1"),
-                make_active_tab(1, "TAB-3"),
-            ],
-            pane_manifest: make_manifest(vec![
-                (0, vec![make_pane(1, "pane-1", true)]),
-                (1, vec![make_pane(2, "new-title", true)]),
+            last_set_names: HashMap::from([
+                (100, "shell".to_string()),
+                (101, "old-closed-tab".to_string()),
             ]),
             ..Default::default()
         };
 
         // Act
         let renames = state.compute_renames();
-        assert_eq!(renames.len(), 1);
-        let (tab_position, _) = &renames[0];
-        assert_eq!(*tab_position, 1);
 
-        // rename_tabs() converts to 1-indexed: 1 + 1 = 2
-        let api_arg = (*tab_position as u32) + 1;
-
-        // Zellij looks up tabs[2-1] = tabs[1], which was deleted → silent no-op
-        let actually_renamed = zellij_server_rename_tab_buggy(&tab_map, api_arg);
-        assert_eq!(
-            actually_renamed,
-            None,
-            "BUG: rename_tab(2) hits deleted key 1, rename silently fails (see issue #3535)"
-        );
+        // Assert — tab_id 100 is already cached as "shell" so skipped;
+        // tab_id 102 needs renaming to "vim"
+        assert_eq!(renames, vec![(102, "vim".to_string())]);
     }
 
     // ── prune_stale_cache_entries ────────────────────────────────────────
 
     #[test]
     fn prune_stale_cache_entries_removes_closed_tab_entries() {
-        // Arrange
+        // Arrange — cache keyed by tab_id; only tab_id 101 survives
         let mut state = State {
-            tabs: vec![make_tab(1, "Tab 2")],
+            tabs: vec![make_tab(0, "Tab 2", 101)],
             last_set_names: HashMap::from([
-                (0, "old-shell".to_string()),
-                (1, "vim".to_string()),
-                (2, "htop".to_string()),
+                (100, "old-shell".to_string()),
+                (101, "vim".to_string()),
+                (102, "htop".to_string()),
             ]),
-            focused_pane_ids: HashMap::from([(0, 10), (1, 20), (2, 30)]),
+            focused_pane_ids: HashMap::from([(100, 10), (101, 20), (102, 30)]),
             ..Default::default()
         };
 
@@ -796,21 +634,21 @@ mod tests {
 
         // Assert
         assert_eq!(state.last_set_names.len(), 1);
-        assert_eq!(state.last_set_names.get(&1), Some(&"vim".to_string()));
+        assert_eq!(state.last_set_names.get(&101), Some(&"vim".to_string()));
         assert_eq!(state.focused_pane_ids.len(), 1);
-        assert_eq!(state.focused_pane_ids.get(&1), Some(&20));
+        assert_eq!(state.focused_pane_ids.get(&101), Some(&20));
     }
 
     #[test]
     fn prune_stale_cache_entries_keeps_all_when_tabs_match() {
         // Arrange
         let mut state = State {
-            tabs: vec![make_tab(0, "Tab 1"), make_tab(1, "Tab 2")],
+            tabs: vec![make_tab(0, "Tab 1", 100), make_tab(1, "Tab 2", 101)],
             last_set_names: HashMap::from([
-                (0, "shell".to_string()),
-                (1, "vim".to_string()),
+                (100, "shell".to_string()),
+                (101, "vim".to_string()),
             ]),
-            focused_pane_ids: HashMap::from([(0, 10), (1, 20)]),
+            focused_pane_ids: HashMap::from([(100, 10), (101, 20)]),
             ..Default::default()
         };
 
@@ -827,8 +665,8 @@ mod tests {
         // Arrange
         let mut state = State {
             tabs: vec![],
-            last_set_names: HashMap::from([(0, "shell".to_string())]),
-            focused_pane_ids: HashMap::from([(0, 10)]),
+            last_set_names: HashMap::from([(100, "shell".to_string())]),
+            focused_pane_ids: HashMap::from([(100, 10)]),
             ..Default::default()
         };
 
@@ -846,9 +684,10 @@ mod tests {
     fn extract_focused_pane_ids_returns_empty_for_empty_manifest() {
         // Arrange
         let manifest = PaneManifest::default();
+        let tabs: Vec<TabInfo> = vec![];
 
         // Act
-        let focused = State::extract_focused_pane_ids(&manifest);
+        let focused = State::extract_focused_pane_ids(&manifest, &tabs);
 
         // Assert
         assert!(focused.is_empty());
@@ -857,28 +696,30 @@ mod tests {
     #[test]
     fn extract_focused_pane_ids_tracks_focused_terminal_pane() {
         // Arrange
+        let tabs = vec![make_tab(0, "Tab 1", 100)];
         let manifest = make_manifest(vec![(
             0,
             vec![make_pane(1, "unfocused", false), make_pane(2, "focused", true)],
         )]);
 
         // Act
-        let focused = State::extract_focused_pane_ids(&manifest);
+        let focused = State::extract_focused_pane_ids(&manifest, &tabs);
 
-        // Assert
-        assert_eq!(focused.get(&0), Some(&2));
+        // Assert — keyed by tab_id (100), not position (0)
+        assert_eq!(focused.get(&100), Some(&2));
     }
 
     #[test]
     fn extract_focused_pane_ids_ignores_plugin_panes() {
         // Arrange
+        let tabs = vec![make_tab(0, "Tab 1", 100)];
         let manifest = make_manifest(vec![(
             0,
             vec![make_plugin_pane(1, "tab-bar", true), make_pane(2, "shell", false)],
         )]);
 
         // Act
-        let focused = State::extract_focused_pane_ids(&manifest);
+        let focused = State::extract_focused_pane_ids(&manifest, &tabs);
 
         // Assert
         assert!(focused.is_empty());
@@ -887,13 +728,14 @@ mod tests {
     #[test]
     fn extract_focused_pane_ids_ignores_suppressed_panes() {
         // Arrange
+        let tabs = vec![make_tab(0, "Tab 1", 100)];
         let manifest = make_manifest(vec![(
             0,
             vec![make_suppressed_pane(1, "hidden", true)],
         )]);
 
         // Act
-        let focused = State::extract_focused_pane_ids(&manifest);
+        let focused = State::extract_focused_pane_ids(&manifest, &tabs);
 
         // Assert
         assert!(focused.is_empty());
@@ -902,6 +744,11 @@ mod tests {
     #[test]
     fn extract_focused_pane_ids_tracks_across_multiple_tabs() {
         // Arrange
+        let tabs = vec![
+            make_tab(0, "Tab 1", 100),
+            make_tab(1, "Tab 2", 101),
+            make_tab(2, "Tab 3", 102),
+        ];
         let manifest = make_manifest(vec![
             (0, vec![make_pane(1, "shell-1", true)]),
             (1, vec![make_pane(2, "vim", false), make_pane(3, "shell-2", true)]),
@@ -909,13 +756,13 @@ mod tests {
         ]);
 
         // Act
-        let focused = State::extract_focused_pane_ids(&manifest);
+        let focused = State::extract_focused_pane_ids(&manifest, &tabs);
 
-        // Assert
+        // Assert — keyed by tab_id
         assert_eq!(focused.len(), 3);
-        assert_eq!(focused.get(&0), Some(&1));
-        assert_eq!(focused.get(&1), Some(&3));
-        assert_eq!(focused.get(&2), Some(&4));
+        assert_eq!(focused.get(&100), Some(&1));
+        assert_eq!(focused.get(&101), Some(&3));
+        assert_eq!(focused.get(&102), Some(&4));
     }
 
     // ── active_tab_pane_to_refocus ───────────────────────────────────────
@@ -936,8 +783,8 @@ mod tests {
     fn active_tab_pane_to_refocus_returns_none_when_no_active_tab() {
         // Arrange
         let state = State {
-            tabs: vec![make_tab(0, "Tab 1"), make_tab(1, "Tab 2")],
-            focused_pane_ids: HashMap::from([(0, 1), (1, 2)]),
+            tabs: vec![make_tab(0, "Tab 1", 100), make_tab(1, "Tab 2", 101)],
+            focused_pane_ids: HashMap::from([(100, 1), (101, 2)]),
             ..Default::default()
         };
 
@@ -952,8 +799,8 @@ mod tests {
     fn active_tab_pane_to_refocus_returns_pane_id_of_active_tab() {
         // Arrange
         let state = State {
-            tabs: vec![make_tab(0, "Tab 1"), make_active_tab(1, "Tab 2")],
-            focused_pane_ids: HashMap::from([(0, 10), (1, 20)]),
+            tabs: vec![make_tab(0, "Tab 1", 100), make_active_tab(1, "Tab 2", 101)],
+            focused_pane_ids: HashMap::from([(100, 10), (101, 20)]),
             ..Default::default()
         };
 
@@ -968,8 +815,8 @@ mod tests {
     fn active_tab_pane_to_refocus_returns_none_when_active_tab_has_no_tracked_pane() {
         // Arrange
         let state = State {
-            tabs: vec![make_tab(0, "Tab 1"), make_active_tab(1, "Tab 2")],
-            focused_pane_ids: HashMap::from([(0, 10)]),
+            tabs: vec![make_tab(0, "Tab 1", 100), make_active_tab(1, "Tab 2", 101)],
+            focused_pane_ids: HashMap::from([(100, 10)]),
             ..Default::default()
         };
 
@@ -985,11 +832,11 @@ mod tests {
         // Arrange
         let state = State {
             tabs: vec![
-                make_tab(0, "Tab 1"),
-                make_active_tab(1, "Tab 2"),
-                make_tab(2, "Tab 3"),
+                make_tab(0, "Tab 1", 100),
+                make_active_tab(1, "Tab 2", 101),
+                make_tab(2, "Tab 3", 102),
             ],
-            focused_pane_ids: HashMap::from([(0, 10), (1, 20), (2, 30)]),
+            focused_pane_ids: HashMap::from([(100, 10), (101, 20), (102, 30)]),
             ..Default::default()
         };
 
@@ -1004,8 +851,8 @@ mod tests {
     fn active_tab_pane_to_refocus_returns_none_when_floating_panes_visible() {
         // Arrange — e.g., the help window opened via Ctrl+/
         let state = State {
-            tabs: vec![make_active_tab_with_floating(0, "Tab 1")],
-            focused_pane_ids: HashMap::from([(0, 10)]),
+            tabs: vec![make_active_tab_with_floating(0, "Tab 1", 100)],
+            focused_pane_ids: HashMap::from([(100, 10)]),
             ..Default::default()
         };
 
@@ -1020,8 +867,8 @@ mod tests {
     fn active_tab_pane_to_refocus_resumes_after_floating_panes_closed() {
         // Arrange — floating panes were visible but are now closed
         let state = State {
-            tabs: vec![make_active_tab(0, "Tab 1")],
-            focused_pane_ids: HashMap::from([(0, 10)]),
+            tabs: vec![make_active_tab(0, "Tab 1", 100)],
+            focused_pane_ids: HashMap::from([(100, 10)]),
             ..Default::default()
         };
 
