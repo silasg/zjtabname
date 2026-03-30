@@ -1,23 +1,26 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use zellij_tile::prelude::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct TabId(usize);
+
 /// Default poll interval (in seconds) for refocusing panes to pick up title
 /// changes. Zellij's PaneUpdate event doesn't fire on title-only changes,
 /// so we periodically refocus to trigger a fresh PaneUpdate.
 /// The CwdChanged event handles the most common case (shell directory changes),
 /// so this timer is primarily a fallback for programs that set their own title
 /// (e.g., vim, htop) without a CWD change.
-/// Override via plugin configuration: `poll_interval_secs "5.0"`.
-const DEFAULT_POLL_INTERVAL_SECS: f64 = 5.0;
+/// Override via plugin configuration: `poll_interval_secs "2.0"`.
+const DEFAULT_POLL_INTERVAL_SECS: f64 = 2.0;
 
 struct State {
     tabs: Vec<TabInfo>,
     pane_manifest: PaneManifest,
     permissions_granted: bool,
     /// Cache: tab_id -> last_set_name (avoid redundant rename calls)
-    last_set_names: HashMap<usize, String>,
+    last_set_names: HashMap<TabId, String>,
     /// Track focused terminal pane IDs per tab_id for timer-based refocus
-    focused_pane_ids: HashMap<usize, u32>,
+    focused_pane_ids: HashMap<TabId, u32>,
     /// Configurable poll interval (seconds) for timer-based refocus
     poll_interval_secs: f64,
 }
@@ -73,24 +76,13 @@ impl ZellijPlugin for State {
                 self.rename_tabs();
             }
             Event::CwdChanged(_pane_id, _path, _client_ids) => {
-                // CWD changed, but the shell prompt hook hasn't updated the
-                // terminal title yet. Refocus the active pane to trigger a
-                // fresh PaneUpdate that will carry the new title.
-                if let Some(pane_id) = self.active_tab_pane_to_refocus() {
-                    focus_terminal_pane(pane_id, false, false);
-                }
+                self.refocus_active_pane();
             }
             Event::PluginConfigurationChanged(config) => {
                 self.apply_configuration(&config);
             }
             Event::Timer(_elapsed) => {
-                // Refocus the pane in the active tab to trigger a fresh PaneUpdate.
-                // This is needed because Zellij doesn't fire PaneUpdate when only
-                // a pane's terminal title changes (e.g., via OSC escape sequences).
-                // Only refocus the active tab to avoid switching tabs as a side effect.
-                if let Some(pane_id) = self.active_tab_pane_to_refocus() {
-                    focus_terminal_pane(pane_id, false, false);
-                }
+                self.refocus_active_pane();
                 set_timeout(self.poll_interval_secs);
             }
             _ => {}
@@ -114,30 +106,27 @@ impl State {
             .get("poll_interval_secs")
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_POLL_INTERVAL_SECS);
-
     }
 
-    /// Remove cache entries for tabs that no longer exist.
     fn prune_stale_cache_entries(&mut self) {
-        let active_tab_ids: HashSet<usize> = self.tabs.iter().map(|t| t.tab_id).collect();
+        let active_tab_ids: HashSet<TabId> = self.tabs.iter().map(|t| TabId(t.tab_id)).collect();
         self.last_set_names
             .retain(|id, _| active_tab_ids.contains(id));
         self.focused_pane_ids
             .retain(|id, _| active_tab_ids.contains(id));
     }
 
-    /// Apply computed renames and update the cache.
     fn rename_tabs(&mut self) {
         let renames = self.compute_renames();
         for (tab_id, name) in renames {
-            rename_tab_with_id(tab_id as u64, &name);
+            rename_tab_with_id(tab_id.0 as u64, &name);
             self.last_set_names.insert(tab_id, name);
         }
     }
 
     /// Compute which tabs need renaming.
     /// Returns a vec of (tab_id, desired name).
-    fn compute_renames(&self) -> Vec<(usize, String)> {
+    fn compute_renames(&self) -> Vec<(TabId, String)> {
         if !self.permissions_granted {
             return vec![];
         }
@@ -149,17 +138,27 @@ impl State {
                     continue;
                 }
 
+                let id = TabId(tab.tab_id);
                 let already_set = self
                     .last_set_names
-                    .get(&tab.tab_id)
+                    .get(&id)
                     .is_some_and(|n| n == &desired_name);
 
                 if !already_set && tab.name != desired_name {
-                    renames.push((tab.tab_id, desired_name));
+                    renames.push((id, desired_name));
                 }
             }
         }
         renames
+    }
+
+    /// Refocus the active tab's pane to trigger a fresh PaneUpdate.
+    /// Used by both CwdChanged (shell directory change) and Timer (fallback for
+    /// programs like vim/htop that set their own title without a CWD change).
+    fn refocus_active_pane(&self) {
+        if let Some(pane_id) = self.active_tab_pane_to_refocus() {
+            focus_terminal_pane(pane_id, false, false);
+        }
     }
 
     /// Return the pane ID to refocus for title polling (only the active tab).
@@ -171,12 +170,12 @@ impl State {
         if active_tab.are_floating_panes_visible {
             return None;
         }
-        self.focused_pane_ids.get(&active_tab.tab_id).copied()
+        self.focused_pane_ids.get(&TabId(active_tab.tab_id)).copied()
     }
 
     /// Extract focused terminal pane IDs from a pane manifest, keyed by tab_id.
-    fn extract_focused_pane_ids(manifest: &PaneManifest, tabs: &[TabInfo]) -> HashMap<usize, u32> {
-        let pos_to_id: HashMap<usize, usize> = tabs.iter().map(|t| (t.position, t.tab_id)).collect();
+    fn extract_focused_pane_ids(manifest: &PaneManifest, tabs: &[TabInfo]) -> HashMap<TabId, u32> {
+        let pos_to_id: HashMap<usize, TabId> = tabs.iter().map(|t| (t.position, TabId(t.tab_id))).collect();
 
         manifest
             .panes
@@ -255,6 +254,73 @@ mod tests {
         PaneManifest {
             panes: entries.into_iter().collect(),
         }
+    }
+
+    // ── apply_configuration ─────────────────────────────────────────────
+
+    #[test]
+    fn apply_configuration_sets_poll_interval_from_valid_float() {
+        // Arrange
+        let mut state = State::default();
+        let config = BTreeMap::from([("poll_interval_secs".to_string(), "3.5".to_string())]);
+
+        // Act
+        state.apply_configuration(&config);
+
+        // Assert
+        assert_eq!(state.poll_interval_secs, 3.5);
+    }
+
+    #[test]
+    fn apply_configuration_uses_default_when_key_missing() {
+        // Arrange
+        let mut state = State::default();
+        let config = BTreeMap::new();
+
+        // Act
+        state.apply_configuration(&config);
+
+        // Assert
+        assert_eq!(state.poll_interval_secs, DEFAULT_POLL_INTERVAL_SECS);
+    }
+
+    #[test]
+    fn apply_configuration_uses_default_for_non_numeric_value() {
+        // Arrange
+        let mut state = State::default();
+        let config = BTreeMap::from([("poll_interval_secs".to_string(), "not-a-number".to_string())]);
+
+        // Act
+        state.apply_configuration(&config);
+
+        // Assert
+        assert_eq!(state.poll_interval_secs, DEFAULT_POLL_INTERVAL_SECS);
+    }
+
+    #[test]
+    fn apply_configuration_uses_default_for_empty_value() {
+        // Arrange
+        let mut state = State::default();
+        let config = BTreeMap::from([("poll_interval_secs".to_string(), "".to_string())]);
+
+        // Act
+        state.apply_configuration(&config);
+
+        // Assert
+        assert_eq!(state.poll_interval_secs, DEFAULT_POLL_INTERVAL_SECS);
+    }
+
+    #[test]
+    fn apply_configuration_ignores_unrelated_keys() {
+        // Arrange
+        let mut state = State::default();
+        let config = BTreeMap::from([("unrelated_key".to_string(), "42".to_string())]);
+
+        // Act
+        state.apply_configuration(&config);
+
+        // Assert
+        assert_eq!(state.poll_interval_secs, DEFAULT_POLL_INTERVAL_SECS);
     }
 
     // ── find_focused_pane_title ──────────────────────────────────────────
@@ -410,7 +476,7 @@ mod tests {
         let renames = state.compute_renames();
 
         // Assert
-        assert_eq!(renames, vec![(100, "my-project".to_string())]);
+        assert_eq!(renames, vec![(TabId(100), "my-project".to_string())]);
     }
 
     #[test]
@@ -427,7 +493,7 @@ mod tests {
         let renames = state.compute_renames();
 
         // Assert — key is tab_id (200), not position (2)
-        assert_eq!(renames, vec![(200, "nvim".to_string())]);
+        assert_eq!(renames, vec![(TabId(200), "nvim".to_string())]);
     }
 
     #[test]
@@ -454,7 +520,7 @@ mod tests {
             permissions_granted: true,
             tabs: vec![make_tab(0, "old-name", 100)],
             pane_manifest: make_manifest(vec![(0, vec![make_pane(1, "shell", true)])]),
-            last_set_names: HashMap::from([(100, "shell".to_string())]),
+            last_set_names: HashMap::from([(TabId(100), "shell".to_string())]),
             ..Default::default()
         };
 
@@ -489,7 +555,7 @@ mod tests {
             permissions_granted: true,
             tabs: vec![make_tab(0, "old-title", 100)],
             pane_manifest: make_manifest(vec![(0, vec![make_pane(1, "new-title", true)])]),
-            last_set_names: HashMap::from([(100, "old-title".to_string())]),
+            last_set_names: HashMap::from([(TabId(100), "old-title".to_string())]),
             ..Default::default()
         };
 
@@ -497,7 +563,7 @@ mod tests {
         let renames = state.compute_renames();
 
         // Assert
-        assert_eq!(renames, vec![(100, "new-title".to_string())]);
+        assert_eq!(renames, vec![(TabId(100), "new-title".to_string())]);
     }
 
     #[test]
@@ -525,8 +591,8 @@ mod tests {
         assert_eq!(
             renames,
             vec![
-                (100, "vim".to_string()),
-                (102, "htop".to_string()),
+                (TabId(100), "vim".to_string()),
+                (TabId(102), "htop".to_string()),
             ]
         );
     }
@@ -548,7 +614,7 @@ mod tests {
         let renames = state.compute_renames();
 
         // Assert
-        assert_eq!(renames, vec![(100, "shell".to_string())]);
+        assert_eq!(renames, vec![(TabId(100), "shell".to_string())]);
     }
 
     #[test]
@@ -576,9 +642,9 @@ mod tests {
         assert_eq!(
             renames,
             vec![
-                (100, "vim".to_string()),
-                (101, "htop".to_string()),
-                (102, "cargo".to_string()),
+                (TabId(100), "vim".to_string()),
+                (TabId(101), "htop".to_string()),
+                (TabId(102), "cargo".to_string()),
             ]
         );
     }
@@ -599,8 +665,8 @@ mod tests {
                 (1, vec![make_pane(3, "vim", true)]),
             ]),
             last_set_names: HashMap::from([
-                (100, "shell".to_string()),
-                (101, "old-closed-tab".to_string()),
+                (TabId(100), "shell".to_string()),
+                (TabId(101), "old-closed-tab".to_string()),
             ]),
             ..Default::default()
         };
@@ -610,7 +676,7 @@ mod tests {
 
         // Assert — tab_id 100 is already cached as "shell" so skipped;
         // tab_id 102 needs renaming to "vim"
-        assert_eq!(renames, vec![(102, "vim".to_string())]);
+        assert_eq!(renames, vec![(TabId(102), "vim".to_string())]);
     }
 
     // ── prune_stale_cache_entries ────────────────────────────────────────
@@ -621,11 +687,11 @@ mod tests {
         let mut state = State {
             tabs: vec![make_tab(0, "Tab 2", 101)],
             last_set_names: HashMap::from([
-                (100, "old-shell".to_string()),
-                (101, "vim".to_string()),
-                (102, "htop".to_string()),
+                (TabId(100), "old-shell".to_string()),
+                (TabId(101), "vim".to_string()),
+                (TabId(102), "htop".to_string()),
             ]),
-            focused_pane_ids: HashMap::from([(100, 10), (101, 20), (102, 30)]),
+            focused_pane_ids: HashMap::from([(TabId(100), 10), (TabId(101), 20), (TabId(102), 30)]),
             ..Default::default()
         };
 
@@ -634,9 +700,9 @@ mod tests {
 
         // Assert
         assert_eq!(state.last_set_names.len(), 1);
-        assert_eq!(state.last_set_names.get(&101), Some(&"vim".to_string()));
+        assert_eq!(state.last_set_names.get(&TabId(101)), Some(&"vim".to_string()));
         assert_eq!(state.focused_pane_ids.len(), 1);
-        assert_eq!(state.focused_pane_ids.get(&101), Some(&20));
+        assert_eq!(state.focused_pane_ids.get(&TabId(101)), Some(&20));
     }
 
     #[test]
@@ -645,10 +711,10 @@ mod tests {
         let mut state = State {
             tabs: vec![make_tab(0, "Tab 1", 100), make_tab(1, "Tab 2", 101)],
             last_set_names: HashMap::from([
-                (100, "shell".to_string()),
-                (101, "vim".to_string()),
+                (TabId(100), "shell".to_string()),
+                (TabId(101), "vim".to_string()),
             ]),
-            focused_pane_ids: HashMap::from([(100, 10), (101, 20)]),
+            focused_pane_ids: HashMap::from([(TabId(100), 10), (TabId(101), 20)]),
             ..Default::default()
         };
 
@@ -665,8 +731,8 @@ mod tests {
         // Arrange
         let mut state = State {
             tabs: vec![],
-            last_set_names: HashMap::from([(100, "shell".to_string())]),
-            focused_pane_ids: HashMap::from([(100, 10)]),
+            last_set_names: HashMap::from([(TabId(100), "shell".to_string())]),
+            focused_pane_ids: HashMap::from([(TabId(100), 10)]),
             ..Default::default()
         };
 
@@ -706,7 +772,7 @@ mod tests {
         let focused = State::extract_focused_pane_ids(&manifest, &tabs);
 
         // Assert — keyed by tab_id (100), not position (0)
-        assert_eq!(focused.get(&100), Some(&2));
+        assert_eq!(focused.get(&TabId(100)), Some(&2));
     }
 
     #[test]
@@ -760,9 +826,9 @@ mod tests {
 
         // Assert — keyed by tab_id
         assert_eq!(focused.len(), 3);
-        assert_eq!(focused.get(&100), Some(&1));
-        assert_eq!(focused.get(&101), Some(&3));
-        assert_eq!(focused.get(&102), Some(&4));
+        assert_eq!(focused.get(&TabId(100)), Some(&1));
+        assert_eq!(focused.get(&TabId(101)), Some(&3));
+        assert_eq!(focused.get(&TabId(102)), Some(&4));
     }
 
     // ── active_tab_pane_to_refocus ───────────────────────────────────────
@@ -784,7 +850,7 @@ mod tests {
         // Arrange
         let state = State {
             tabs: vec![make_tab(0, "Tab 1", 100), make_tab(1, "Tab 2", 101)],
-            focused_pane_ids: HashMap::from([(100, 1), (101, 2)]),
+            focused_pane_ids: HashMap::from([(TabId(100), 1), (TabId(101), 2)]),
             ..Default::default()
         };
 
@@ -800,7 +866,7 @@ mod tests {
         // Arrange
         let state = State {
             tabs: vec![make_tab(0, "Tab 1", 100), make_active_tab(1, "Tab 2", 101)],
-            focused_pane_ids: HashMap::from([(100, 10), (101, 20)]),
+            focused_pane_ids: HashMap::from([(TabId(100), 10), (TabId(101), 20)]),
             ..Default::default()
         };
 
@@ -816,7 +882,7 @@ mod tests {
         // Arrange
         let state = State {
             tabs: vec![make_tab(0, "Tab 1", 100), make_active_tab(1, "Tab 2", 101)],
-            focused_pane_ids: HashMap::from([(100, 10)]),
+            focused_pane_ids: HashMap::from([(TabId(100), 10)]),
             ..Default::default()
         };
 
@@ -836,7 +902,7 @@ mod tests {
                 make_active_tab(1, "Tab 2", 101),
                 make_tab(2, "Tab 3", 102),
             ],
-            focused_pane_ids: HashMap::from([(100, 10), (101, 20), (102, 30)]),
+            focused_pane_ids: HashMap::from([(TabId(100), 10), (TabId(101), 20), (TabId(102), 30)]),
             ..Default::default()
         };
 
@@ -852,7 +918,7 @@ mod tests {
         // Arrange — e.g., the help window opened via Ctrl+/
         let state = State {
             tabs: vec![make_active_tab_with_floating(0, "Tab 1", 100)],
-            focused_pane_ids: HashMap::from([(100, 10)]),
+            focused_pane_ids: HashMap::from([(TabId(100), 10)]),
             ..Default::default()
         };
 
@@ -868,7 +934,7 @@ mod tests {
         // Arrange — floating panes were visible but are now closed
         let state = State {
             tabs: vec![make_active_tab(0, "Tab 1", 100)],
-            focused_pane_ids: HashMap::from([(100, 10)]),
+            focused_pane_ids: HashMap::from([(TabId(100), 10)]),
             ..Default::default()
         };
 
