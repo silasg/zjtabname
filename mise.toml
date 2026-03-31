@@ -7,6 +7,10 @@ rust = "latest"
 [hooks]
 enter = "rustup target add wasm32-wasip1 2>/dev/null"
 
+[tasks.lint]
+description = "Run clippy lints"
+run = "cargo clippy --target $(rustc -vV | sed -n 's/host: //p') -- -D warnings"
+
 [tasks.build]
 description = "Build the WASM plugin (release)"
 run = "cargo build --release"
