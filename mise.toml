@@ -3,6 +3,7 @@ experimental = true
 
 [tools]
 rust = "latest"
+"cargo:git-cliff" = "latest"
 
 [hooks]
 enter = "rustup target add wasm32-wasip1 2>/dev/null"
@@ -18,6 +19,10 @@ run = "cargo build --release"
 [tasks.test]
 description = "Run unit tests (native target)"
 run = "cargo test --target $(rustc -vV | sed -n 's/host: //p')"
+
+[tasks.changelog]
+description = "Preview unreleased changelog entries"
+run = "git cliff --unreleased"
 
 [tasks.install]
 description = "Build and install the plugin to Zellij plugin directory"
