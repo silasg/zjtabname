@@ -11,6 +11,7 @@ All notable changes to this project will be documented in this file.
 ### 🐛 Bug Fixes
 
 - **ci:** Drop dtolnay/rust-toolchain, rely on mise for Rust + clippy + wasm target
+- **ci:** Add setup step to install clippy and wasm target in CI
 
 ### 👷 CI/CD
 
