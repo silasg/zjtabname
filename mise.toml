@@ -7,7 +7,7 @@ rust = "latest"
 "cargo:cargo-release" = "latest"
 
 [hooks]
-enter = "rustup target add wasm32-wasip1 2>/dev/null"
+enter = "rustup target add wasm32-wasip1 2>/dev/null && rustup component add clippy 2>/dev/null"
 
 [tasks.lint]
 description = "Run clippy lints"

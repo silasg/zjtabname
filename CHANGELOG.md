@@ -8,6 +8,10 @@ All notable changes to this project will be documented in this file.
 
 - Upgrade to zellij-tile 0.44 with rename_tab_with_id and CwdChanged
 
+### 🐛 Bug Fixes
+
+- **ci:** Drop dtolnay/rust-toolchain, rely on mise for Rust + clippy + wasm target
+
 ### 👷 CI/CD
 
 - Add GitHub Actions workflow for lint, test, and WASM build
