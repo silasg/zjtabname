@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.2.0] - 2026-04-01
 
 ### ✨ Features
 
@@ -15,6 +15,7 @@ All notable changes to this project will be documented in this file.
 ### 👷 CI/CD
 
 - Add GitHub Actions workflow for lint, test, and WASM build
+- Add GitHub Actions release workflow for WASM plugin
 
 ### 📚 Documentation
 
@@ -26,6 +27,7 @@ All notable changes to this project will be documented in this file.
 - **config:** Revert default poll interval to 2 seconds
 - Bump version to 0.2.0 for zellij-tile 0.44 upgrade
 - Add git-cliff config and generate initial CHANGELOG.md
+- Add cargo-release config and release mise tasks
 ## [0.1.0-pre-zellij-0.44] - 2026-03-12
 
 ### ♻️ Refactor
