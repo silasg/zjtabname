@@ -17,6 +17,9 @@ jobs:
 
       - uses: jdx/mise-action@v2
 
+      - name: Setup
+        run: mise run setup
+
       - name: Lint
         run: mise run lint
 

@@ -9,6 +9,13 @@ rust = "latest"
 [hooks]
 enter = "rustup target add wasm32-wasip1 2>/dev/null && rustup component add clippy 2>/dev/null"
 
+[tasks.setup]
+description = "One-time setup (install rustup components)"
+run = """
+rustup target add wasm32-wasip1
+rustup component add clippy
+"""
+
 [tasks.lint]
 description = "Run clippy lints"
 run = "cargo clippy --target $(rustc -vV | sed -n 's/host: //p') -- -D warnings"
