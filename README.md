@@ -10,21 +10,22 @@ Tab titles update when:
 
 ## Install
 
+### Using mise (recommended)
+
+[mise](https://mise.jdx.dev/) handles Rust installation and the WASM target automatically:
+
+```bash
+mise run build
+mise run install
+```
+
+### Using cargo
+
 Requires Rust with the `wasm32-wasip1` target:
 
 ```bash
 rustup target add wasm32-wasip1
-```
-
-Build the plugin:
-
-```bash
 cargo build --release
-```
-
-Copy the WASM binary to Zellij's plugin directory:
-
-```bash
 mkdir -p ~/.config/zellij/plugins
 cp target/wasm32-wasip1/release/zjtabname.wasm ~/.config/zellij/plugins/
 ```
