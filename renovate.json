@@ -1,6 +1,8 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:recommended"],
+  "mode": "full",
+  "dependencyDashboard": true,
   "packageRules": [
     {
       "description": "Automerge patch and minor updates when CI passes",
