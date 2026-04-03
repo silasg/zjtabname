@@ -5,6 +5,7 @@ experimental = true
 rust = "latest"
 "cargo:git-cliff" = "latest"
 "cargo:cargo-release" = "latest"
+"cargo:cargo-cyclonedx" = "0.5"
 
 [hooks]
 enter = "rustup target add wasm32-wasip1 2>/dev/null && rustup component add clippy 2>/dev/null"
@@ -43,6 +44,10 @@ run = "cargo release minor --execute"
 [tasks.release-major]
 description = "Release a major version (breaking changes)"
 run = "cargo release major --execute"
+
+[tasks.sbom]
+description = "Generate CycloneDX SBOM"
+run = "cargo cyclonedx --format json --spec-version 1.5 --top-level --override-filename zjtabname.cdx"
 
 [tasks.install]
 description = "Build and install the plugin to Zellij plugin directory"

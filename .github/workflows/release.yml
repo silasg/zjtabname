@@ -22,11 +22,18 @@ jobs:
       - name: Build WASM plugin
         run: mise run build
 
-      - name: Rename artifact
-        run: cp target/wasm32-wasip1/release/zjtabname.wasm zjtabname-${{ github.ref_name }}.wasm
+      - name: Generate SBOM
+        run: mise run sbom
+
+      - name: Rename artifacts
+        run: |
+          cp target/wasm32-wasip1/release/zjtabname.wasm zjtabname-${{ github.ref_name }}.wasm
+          mv zjtabname.cdx.json zjtabname-${{ github.ref_name }}.cdx.json
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: zjtabname-${{ github.ref_name }}.wasm
+          files: |
+            zjtabname-${{ github.ref_name }}.wasm
+            zjtabname-${{ github.ref_name }}.cdx.json
