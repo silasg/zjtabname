@@ -4,6 +4,8 @@ A [Zellij](https://zellij.dev/) plugin that automatically sets each tab's title 
 
 **Requires Zellij ≥ 0.44.0.**
 
+![zjtabname demo](zjtabname_demo.gif)
+
 Tab titles update when:
 - Focus moves to a different pane within a tab
 - The focused pane's title changes (e.g., a shell sets its terminal title via OSC escape sequences)
